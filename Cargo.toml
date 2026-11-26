@@ -5,3 +5,10 @@ edition = "2024"
 rust-version = "1.88"
 description = "An embedded byte-oriented key-value storage engine"
 readme = "README.md"
+
+[dependencies]
+crc32fast = "1.5"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

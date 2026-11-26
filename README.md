@@ -1,6 +1,6 @@
 # MiniDB
 
-MiniDB is a Rust embedded key-value engine. Milestone 1 implements its in-memory MemTable and byte-oriented API using the Rust standard library. It requires Rust 1.88 or newer.
+MiniDB is a Rust embedded key-value engine. Milestone 2 adds a durable write-ahead log (WAL) and crash recovery for the in-memory MemTable. The crate requires Rust 1.88 or newer. Opening a database requires Unix advisory file locking and permission to open and synchronize the resolved database directory and every ancestor up to the root. Each of those directories must support directory synchronization.
 
 ## Usage
 
@@ -10,25 +10,31 @@ use minidb::{MiniDB, Result};
 fn main() -> Result<()> {
     let db = MiniDB::open("./data")?;
     db.put(b"user:1", b"Alice")?;
+    db.put(b"user:2", b"Bob")?;
+    db.delete(b"user:2")?;
+    db.close()?;
+
+    let db = MiniDB::open("./data")?;
     assert_eq!(db.get(b"user:1")?.as_deref(), Some(b"Alice".as_slice()));
-    db.delete(b"user:1")?;
-    assert_eq!(db.get(b"user:1")?, None);
+    assert_eq!(db.get(b"user:2")?, None);
     db.close()
 }
 ```
 
-Keys and values can contain arbitrary bytes. Keys must have at least one byte, and a stored empty value is returned as `Some(Vec::new())`. `open_with_options` accepts optional key and value length limits in bytes. Both default to unlimited. Invalid mutations return an error before changing the table.
+Keys and values can contain arbitrary bytes. Keys must have at least one byte, and a stored empty value is returned as `Some(Vec::new())`. The WAL format limits each key and value to `u32::MAX` bytes. `open_with_options` accepts smaller per-handle limits in bytes. Limits apply to operations on that handle. Recovery applies existing records in order using the format limits.
 
 ## Architecture
 
-`MiniDB` validates inputs and delegates reads and mutations to a MemTable backed by a `BTreeMap` that orders keys lexicographically by byte. Each key maps to a value or a tombstone, which lets the MemTable distinguish a recorded deletion from a key it has never seen. The public `get` API returns `None` for both cases and returns owned bytes for a value.
+`MiniDB::open` creates missing directories, acquires an exclusive advisory lock, and replays the WAL into a `BTreeMap` MemTable. The lock stays held until the handle closes or the process exits. Each key maps to a value or a tombstone. The public `get` API returns owned bytes for a value and `None` for a deleted or missing key.
 
-A `RefCell` lets callers use the handle through `&self` for single-threaded access. Each call to `open` creates an independent empty database. The path is reserved for the persistent engine and is currently ignored. `close` consumes the handle and releases the data, and `flush` returns `Error::PersistenceUnavailable`. A deletion retains the key and its tombstone until overwritten or the handle is dropped.
+Each successful `put` or `delete` appends and synchronizes one WAL record before changing the MemTable. After an append or synchronization error, reads still observe the current MemTable and the handle requires reopening before further mutations. Recovery discards an incomplete final record and reports corrupt data. A complete record can be recovered even when its call did not return success. See the [WAL format and durability model](docs/storage_format.md).
+
+A `RefCell` provides single-threaded access through `&self`. The full logical state fits in memory, and the WAL grows with every successful mutation. `flush` returns `Error::PersistenceUnavailable` until persistent table storage is implemented.
 
 ## Verification
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test --locked
 ```

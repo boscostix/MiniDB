@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, io};
 
 /// An error returned by a MiniDB operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,8 +10,34 @@ pub enum Error {
     KeyTooLarge { len: usize, max: usize },
     /// A value exceeds the configured length limit in bytes.
     ValueTooLarge { len: usize, max: usize },
-    /// The in-memory engine has no persistent storage to flush to.
+    /// Persistent table storage is unavailable for a flush.
     PersistenceUnavailable,
+    /// Another handle has already locked the database directory.
+    DatabaseLocked,
+    /// An operation failed at the filesystem boundary.
+    Io {
+        operation: &'static str,
+        kind: io::ErrorKind,
+        message: String,
+    },
+    /// The write-ahead log contains invalid data at the given byte offset.
+    CorruptWal { offset: u64, reason: &'static str },
+    /// The database was created with an unsupported WAL version.
+    UnsupportedWalVersion { version: u16 },
+    /// A previous WAL append or synchronization failed. Reopen before writing.
+    WalWriteFailed,
+    /// Memory could not be allocated for a WAL record during recovery.
+    WalAllocationFailed { bytes: usize },
+}
+
+impl Error {
+    pub(crate) fn io(operation: &'static str, error: io::Error) -> Self {
+        Self::Io {
+            operation,
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -27,7 +53,21 @@ impl fmt::Display for Error {
                     "value length of {len} bytes exceeds the {max}-byte limit"
                 )
             }
-            Self::PersistenceUnavailable => f.write_str("persistent storage is unavailable"),
+            Self::PersistenceUnavailable => f.write_str("persistent table storage is unavailable"),
+            Self::DatabaseLocked => f.write_str("database directory is already locked"),
+            Self::Io {
+                operation, message, ..
+            } => write!(f, "{operation}: {message}"),
+            Self::CorruptWal { offset, reason } => {
+                write!(f, "corrupt WAL at byte {offset}: {reason}")
+            }
+            Self::UnsupportedWalVersion { version } => {
+                write!(f, "unsupported WAL version {version}")
+            }
+            Self::WalWriteFailed => f.write_str("a WAL write failed; reopen the database"),
+            Self::WalAllocationFailed { bytes } => {
+                write!(f, "could not allocate {bytes} bytes for WAL recovery")
+            }
         }
     }
 }

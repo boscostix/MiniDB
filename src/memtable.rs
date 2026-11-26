@@ -11,11 +11,11 @@ pub(crate) struct MemTable {
 }
 
 impl MemTable {
-    pub(crate) fn insert(&mut self, key: &[u8], entry: Entry) {
-        if let Some(existing) = self.entries.get_mut(key) {
+    pub(crate) fn insert(&mut self, key: impl AsRef<[u8]> + Into<Vec<u8>>, entry: Entry) {
+        if let Some(existing) = self.entries.get_mut(key.as_ref()) {
             *existing = entry;
         } else {
-            self.entries.insert(key.to_vec(), entry);
+            self.entries.insert(key.into(), entry);
         }
     }
 
