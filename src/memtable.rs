@@ -1,26 +1,53 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, mem::size_of};
 
 pub(crate) enum Entry {
     Value(Vec<u8>),
     Tombstone,
 }
 
+impl Entry {
+    pub(crate) fn payload_len(&self) -> usize {
+        match self {
+            Self::Value(value) => value.len(),
+            Self::Tombstone => 0,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct MemTable {
     entries: BTreeMap<Vec<u8>, Entry>,
+    bytes: usize,
 }
 
 impl MemTable {
     pub(crate) fn insert(&mut self, key: impl AsRef<[u8]> + Into<Vec<u8>>, entry: Entry) {
         if let Some(existing) = self.entries.get_mut(key.as_ref()) {
+            self.bytes -= existing.payload_len();
+            self.bytes += entry.payload_len();
             *existing = entry;
         } else {
+            self.bytes += key.as_ref().len() + entry.payload_len() + size_of::<(Vec<u8>, Entry)>();
             self.entries.insert(key.into(), entry);
         }
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Option<&Entry> {
         self.entries.get(key)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&[u8], &Entry)> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| (key.as_slice(), entry))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn approximate_bytes(&self) -> usize {
+        self.bytes
     }
 }
 

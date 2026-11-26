@@ -10,7 +10,7 @@ pub enum Error {
     KeyTooLarge { len: usize, max: usize },
     /// A value exceeds the configured length limit in bytes.
     ValueTooLarge { len: usize, max: usize },
-    /// Persistent table storage is unavailable for a flush.
+    /// Reserved for compatibility with the WAL-only engine.
     PersistenceUnavailable,
     /// Another handle has already locked the database directory.
     DatabaseLocked,
@@ -28,6 +28,16 @@ pub enum Error {
     WalWriteFailed,
     /// Memory could not be allocated for a WAL record during recovery.
     WalAllocationFailed { bytes: usize },
+    /// Manifest contents do not describe a valid storage state.
+    CorruptManifest { reason: &'static str },
+    /// An immutable table contains invalid metadata or block data.
+    CorruptSstable { id: u64, reason: &'static str },
+    /// The next flush generation cannot be represented.
+    GenerationExhausted,
+    /// Manifest replacement or synchronization failed. Reopen before writing.
+    FlushRequiresReopen,
+    /// A mutation is durable and visible, but its automatic flush failed.
+    AutoFlushFailed { cause: Box<Error> },
 }
 
 impl Error {
@@ -68,11 +78,30 @@ impl fmt::Display for Error {
             Self::WalAllocationFailed { bytes } => {
                 write!(f, "could not allocate {bytes} bytes for WAL recovery")
             }
+            Self::CorruptManifest { reason } => write!(f, "corrupt manifest: {reason}"),
+            Self::CorruptSstable { id, reason } => write!(f, "corrupt SSTable {id}: {reason}"),
+            Self::GenerationExhausted => f.write_str("SSTable generation space is exhausted"),
+            Self::FlushRequiresReopen => {
+                f.write_str("reopen the database after uncertain manifest publication")
+            }
+            Self::AutoFlushFailed { cause } => {
+                write!(
+                    f,
+                    "mutation is durable and visible, but automatic flush failed: {cause}"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AutoFlushFailed { cause } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// The result of a MiniDB operation.
 pub type Result<T> = std::result::Result<T, Error>;

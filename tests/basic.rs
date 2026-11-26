@@ -133,7 +133,7 @@ fn creates_independent_databases() -> Result<()> {
     let other = MiniDB::open(other_directory.path())?;
     db.put(b"key", b"value")?;
     assert_eq!(other.get(b"key")?, None);
-    assert_eq!(db.flush(), Err(Error::PersistenceUnavailable));
+    db.flush()?;
     assert_eq!(db.get(b"key")?, Some(b"value".to_vec()));
     db.close()?;
     assert_eq!(

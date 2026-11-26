@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crc32fast::Hasher;
@@ -9,10 +9,10 @@ use crc32fast::Hasher;
 use crate::{
     Error, Result,
     memtable::{Entry, MemTable},
+    storage::{numbered_file_id, stage_file},
 };
 
 const WAL_NAME: &str = "wal.log";
-const WAL_STAGING_NAME: &str = "wal.log.tmp";
 const MAGIC: &[u8; 6] = b"MINIDB";
 const VERSION: u16 = 1;
 const FILE_HEADER_LEN: usize = MAGIC.len() + 2;
@@ -30,17 +30,25 @@ pub(crate) struct Wal {
 impl Wal {
     pub(crate) const MAX_FIELD_LEN: usize = u32::MAX as usize;
 
-    pub(crate) fn open(directory: &Path, memtable: &mut MemTable) -> Result<Self> {
-        let path = directory.join(WAL_NAME);
-        let mut file = match open_wal_file(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create_wal(directory, &path)?;
-                open_wal_file(&path).map_err(|error| Error::io("open new WAL", error))?
-            }
-            Err(error) => return Err(Error::io("open WAL", error)),
-        };
+    pub(crate) fn open_legacy(directory: &Path, memtable: &mut MemTable) -> Result<Self> {
+        match open_wal_file(&Self::path(directory, 0)) {
+            Ok(file) => Self::recover(file, memtable),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::create(directory, 0),
+            Err(error) => Err(Error::io("open legacy WAL", error)),
+        }
+    }
 
+    pub(crate) fn open_existing(
+        directory: &Path,
+        generation: u64,
+        memtable: &mut MemTable,
+    ) -> Result<Self> {
+        let file = open_wal_file(&Self::path(directory, generation))
+            .map_err(|error| Error::io("open manifest-referenced WAL", error))?;
+        Self::recover(file, memtable)
+    }
+
+    fn recover(mut file: File, memtable: &mut MemTable) -> Result<Self> {
         let length = file
             .metadata()
             .map_err(|error| Error::io("read WAL metadata", error))?
@@ -59,6 +67,40 @@ impl Wal {
         })
     }
 
+    pub(crate) fn create(directory: &Path, generation: u64) -> Result<Self> {
+        let path = Self::path(directory, generation);
+        let (temporary, mut file) = stage_file(&path)?;
+        file.write_all(MAGIC)
+            .and_then(|()| file.write_all(&VERSION.to_le_bytes()))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| Error::io("write and synchronize WAL header", error))?;
+        fs::rename(temporary, &path).map_err(|error| Error::io("publish new WAL", error))?;
+        let file = open_wal_file(&path).map_err(|error| Error::io("open new WAL", error))?;
+        Ok(Self {
+            file,
+            write_failed: false,
+        })
+    }
+
+    pub(crate) fn path(directory: &Path, generation: u64) -> PathBuf {
+        if generation == 0 {
+            directory.join(WAL_NAME)
+        } else {
+            directory.join(format!("wal-{generation:020}.log"))
+        }
+    }
+
+    pub(crate) fn numbered_id(name: &str) -> Option<u64> {
+        numbered_file_id(name, "wal-", ".log")
+    }
+
+    pub(crate) fn ensure_writable(&self) -> Result<()> {
+        if self.write_failed {
+            return Err(Error::WalWriteFailed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn append(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         self.append_and_sync(key, value, File::sync_all)
     }
@@ -69,9 +111,7 @@ impl Wal {
         value: Option<&[u8]>,
         sync: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<()> {
-        if self.write_failed {
-            return Err(Error::WalWriteFailed);
-        }
+        self.ensure_writable()?;
         let kind = if value.is_some() { PUT } else { DELETE };
         let value = value.unwrap_or_default();
         let key_len = u32::try_from(key.len()).map_err(|_| Error::KeyTooLarge {
@@ -109,28 +149,6 @@ impl Wal {
 
 fn open_wal_file(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).append(true).open(path)
-}
-
-fn create_wal(directory: &Path, path: &Path) -> Result<()> {
-    // A prior attempt may have died while writing the unpublished header.
-    let staging = directory.join(WAL_STAGING_NAME);
-    match fs::remove_file(&staging) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(Error::io("remove stale WAL staging file", error)),
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)
-        .map_err(|error| Error::io("create WAL staging file", error))?;
-    file.write_all(MAGIC)
-        .and_then(|()| file.write_all(&VERSION.to_le_bytes()))
-        .and_then(|()| file.sync_all())
-        .map_err(|error| Error::io("write and synchronize WAL header", error))?;
-    fs::rename(staging, path).map_err(|error| Error::io("publish new WAL", error))?;
-    // MiniDB::open synchronizes the containing directory before returning.
-    Ok(())
 }
 
 fn replay(reader: &mut impl Read, length: u64, memtable: &mut MemTable) -> Result<u64> {
@@ -245,7 +263,7 @@ mod tests {
     #[test]
     fn failed_append_poisons_writes() {
         let directory = tempfile::tempdir().unwrap();
-        let mut wal = Wal::open(directory.path(), &mut MemTable::default()).unwrap();
+        let mut wal = Wal::open_legacy(directory.path(), &mut MemTable::default()).unwrap();
         wal.file = File::open(directory.path().join(WAL_NAME)).unwrap();
 
         assert!(matches!(
@@ -261,7 +279,7 @@ mod tests {
     #[test]
     fn failed_sync_poisons_writes() {
         let directory = tempfile::tempdir().unwrap();
-        let mut wal = Wal::open(directory.path(), &mut MemTable::default()).unwrap();
+        let mut wal = Wal::open_legacy(directory.path(), &mut MemTable::default()).unwrap();
 
         assert!(matches!(
             wal.append_and_sync(b"key", Some(b"value"), |_| {
