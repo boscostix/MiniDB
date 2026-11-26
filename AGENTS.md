@@ -4,23 +4,24 @@ MiniDB is an embedded Rust key-value engine being built around an LSM tree. The 
 
 ## Current state
 
-Milestones 1 and 2 implement the in-memory byte API and durable WAL recovery. The crate uses Rust 2024 and requires Rust 1.88 or newer. It uses `crc32fast` for checksums and `fs2` for advisory file locking.
+Milestones 1–3 implement the byte API, durable WAL recovery, and an LSM read path with immutable tables. The crate uses Rust 2024 and requires Rust 1.88 or newer. It uses `crc32fast` for checksums and `fs2` for advisory file locking.
 
 - `src/lib.rs` exports `MiniDB`, `Options`, `Error`, and `Result`.
-- `src/db.rs` implements the public API, acquires the directory lock, and applies mutations to the MemTable after WAL synchronization. A `RefCell` allows single-threaded access through `&self`.
-- `src/memtable.rs` uses a `BTreeMap` ordered lexicographically by key bytes. It distinguishes a stored value, a tombstone, and a missing key. The public `get` returns owned bytes for a stored value and `None` for a tombstone or missing key.
-- `src/wal.rs` publishes, appends, and replays WAL version 1. Recovery validates record headers and payloads, truncates a recoverable incomplete tail, and reports corruption. See [WAL format and durability](docs/storage_format.md).
+- `src/db.rs` implements the public API and coordinates locking, reads, recovery, and synchronous flushes. A `RefCell` allows single-threaded access through `&self`.
+- `src/memtable.rs` uses a `BTreeMap`, tracks approximate memory use, and stores values and explicit tombstones. Reads check active memory first and then immutable tables from newest to oldest. A tombstone ends the search.
+- `src/wal.rs` creates, appends, and replays WAL version 1. A write synchronizes the WAL before updating the MemTable. Recovery validates record headers and payloads, repairs an incomplete tail, and reports corruption.
+- `src/sstable.rs` writes sorted, checksummed blocks and loads a sparse index for point lookups. `src/manifest.rs` records the active WAL and live tables in generation order. See [storage formats and durability](docs/storage_format.md).
 - `src/options.rs` and `src/error.rs` define optional per-handle input limits and typed errors. The WAL format bounds each field, and replay uses format limits. All key operations reject empty keys. Empty values are valid.
-- `tests/basic.rs` covers the public API, and `tests/recovery.rs` covers restart, damaged logs, exclusive opens, and forced process termination. WAL and MemTable unit tests live alongside their implementations.
+- Public API and recovery tests cover restart, damaged files, exclusive opens, cross-table precedence, and forced process termination. Internal fault injection exercises interrupted flush stages.
 
-`open` requires Unix directory synchronization and holds the directory lock until the handle is dropped or the process exits. A failed WAL append or sync leaves the current MemTable intact and requires reopening for more writes. The full logical state lives in memory, and the WAL grows with every mutation. `flush` returns `Error::PersistenceUnavailable` until persistent table storage is implemented.
+`open` requires Unix directory synchronization and holds the directory lock until the handle is dropped or the process exits. A failed WAL append or sync leaves the current MemTable intact and requires reopening for more writes. A flush stages the table and the next WAL, publishes a durable manifest, then retires the old WAL. The ordinary threshold is 4 MiB of approximate MemTable usage and callers can override it with `open_with_flush_threshold`. A threshold-crossing mutation can return `AutoFlushFailed` after its WAL sync and MemTable update. Table count and read amplification grow between compactions, which arrive in Milestone 4.
 
 ## Milestones
 
 1. **Complete.** In-memory byte API, MemTable, typed errors, options, and tests.
 2. **Complete.** Checksummed binary WAL, strict synchronization before mutation acknowledgment, ordered recovery, and an exclusive directory lock. Verified restart, incomplete tails, corruption, and forced process termination.
-3. **Next, when explicitly requested.** Add versioned, indexed SSTables, MemTable flushing, safe WAL rotation, and a crash-consistent manifest. Publish metadata durably before removing superseded files.
-4. Add background compaction using a sorted-stream merge. Preserve newest-value precedence and keep tombstones until dropping them cannot expose older values.
+3. **Complete.** Indexed SSTables, manual and automatic MemTable flushing, WAL rotation, and a crash-consistent manifest. Milestone 2 databases migrate from the legacy `wal.log`.
+4. **Next, when explicitly requested.** Add background compaction using a sorted-stream merge. Preserve newest-value precedence and keep tombstones until dropping them cannot expose older values.
 5. Add thread-safe access, document consistency and visibility, and validate concurrent operations and crash recovery with randomized testing and fault injection.
 6. Add Bloom filters and a bounded block cache. Measure throughput, latency percentiles, memory use, and relevant storage tradeoffs with reproducible benchmarks.
 
@@ -39,7 +40,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 ```
 
-Milestone 2 passed formatting and strict Clippy on Rust 1.100. All 24 reported tests passed on Rust 1.100 and Rust 1.88 on macOS, including forced process termination and recovery. Report future test and benchmark results only after running them.
+Milestone 3 passed formatting and strict Clippy on Rust 1.100. All 35 reported tests passed on Rust 1.100 and Rust 1.88 on macOS, including process interruption at four flush publication boundaries and an ambiguous manifest rename error. Report future test and benchmark results only after running them.
 
 ## Agent workflow
 
