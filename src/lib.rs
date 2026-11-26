@@ -3,6 +3,7 @@
 //! Mutations are synchronized to a write-ahead log before they become visible.
 //! Opening a database loads the table indexes and replays its active log.
 
+mod compaction;
 mod db;
 mod error;
 mod manifest;

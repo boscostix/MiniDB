@@ -28,15 +28,38 @@ An SSTable is named `sst-{id}.sst`, with the ID written as 20 zero-padded decima
 
 Opening a table validates its header, ID, index checksum, block bounds, and index ordering. The database retains the table path and index. Lookups binary-search the sparse index, open the selected file for the candidate block read, and verify the block checksum, record structure, and ordering. An unread data block can contain corruption discovered only when the block is read.
 
-## Manifest version 1
+## Manifest versions 1 and 2
 
-The `MANIFEST` contains seven ASCII bytes `MINIMAN`, a one-byte version number with value 1, an eight-byte active WAL generation, an eight-byte live table count, the same number of eight-byte table IDs in ascending order, and a four-byte CRC-32 of the preceding bytes. The highest live table ID has newest precedence. ID 0 is reserved for the legacy WAL. A successful flush increments the active generation and uses that generation as the new table ID.
+A version 2 manifest has the following fields in order.
+
+| Field | Size | Meaning |
+| --- | --- | --- |
+| Magic and version | 8 bytes | Seven ASCII bytes `MINIMAN` followed by a byte with value 2 |
+| Active WAL generation | 8 bytes | ID of the WAL to replay, with 0 for the legacy WAL |
+| File ID high-water mark | 8 bytes | Upper bound on the active WAL generation and every live table ID |
+| Live table count | 8 bytes | Number of live table IDs that follow |
+| Live table IDs | 8 bytes each | Unique, nonzero IDs in oldest-to-newest lookup precedence order |
+| Checksum | 4 bytes | IEEE CRC-32 of all preceding manifest bytes |
+
+MiniDB can also read Milestone 3's version 1 manifest. Its fields have the same layout without the high-water mark, and its table IDs must be in strictly ascending order. MiniDB uses the active WAL generation as the initial high-water mark for a version 1 manifest. New publications use version 2. Older versions of MiniDB cannot open the database once it uses version 2.
+
+A flush allocates a new ID above the handle's current high-water mark and uses it for both the new WAL generation and the new table. A compaction reserves a new table ID without changing the active WAL generation and skips occupied SSTable file names and staging names. A concurrent flush can publish a greater ID before the worker publishes its output. The high-water mark prevents reuse of previously published IDs, and the explicit manifest order determines lookup precedence even when IDs are out of order.
 
 ## Publication and recovery
 
 Each staged file uses the destination name with a `.tmp` suffix. If the manifest is absent and no numbered storage files exist, MiniDB opens or creates `wal.log`, synchronizes it and the directory ancestry, and publishes a generation-zero manifest. This also migrates WAL-only databases. Upgrade is one-way for writers. A WAL-only version ignores the manifest and can write to `wal.log` even after a newer version has rotated to a numbered WAL. A manifest missing alongside numbered artifacts, an unreadable manifest, or a missing file named in the manifest produces an error.
 
 A flush holds the active MemTable intact while it builds a new table and a new empty WAL. MiniDB synchronizes each staged file before renaming it, then synchronizes the directory to persist both names. It synchronizes the staged manifest, atomically replaces `MANIFEST`, and synchronizes the directory again. Only after the replacement is durable does it switch the in-memory state and attempt to remove the old WAL. An error during manifest rename or subsequent directory synchronization leaves publication uncertain. MiniDB keeps both generations and requires reopening before another mutation or flush. A failure before the rename attempt leaves the current generation active and permits retrying the flush. Recovery uses whichever complete manifest the filesystem exposes and synchronizes the selected state before attempting to remove obsolete files.
+
+### Background compaction
+
+The worker starts when at least four tables are live after open or a flush. It snapshots the four oldest and streams their checked data blocks in byte-key order, keeping one current block per input and the output's sparse index. For each key it copies the newest value, including an empty value. It omits a winning tombstone because the merge includes every older table. Any table outside the merge keeps its values and tombstones. A merged set with no remaining values produces no output file.
+
+The worker synchronizes the staged output, renames it into place, and synchronizes the directory. It then takes the metadata lock, updates the current manifest by replacing the merged prefix, and uses the same staged manifest synchronization, atomic replacement, and directory synchronization as a flush. Any table appended by a concurrent flush stays in the newer suffix. The active WAL is unchanged. After publication is durable, new lookups see the new table set. Lookups that selected the previous set can still read it, and MiniDB reclaims inputs after the last reference is released.
+
+Errors before manifest replacement leave the inputs live. During replacement or the following directory sync an error makes publication uncertain. MiniDB keeps both possible file sets, continues reading the previously selected tables, and rejects further mutations and flushes until reopen. The worker stops after its first error and reports it through `compaction_error` and `close`. An unexpected worker panic is reported by `close`. Close and drop stop scheduling and wait for an in-progress compaction before unlocking the directory. Drop has no error return.
+
+### Reopen
 
 On every successful open, MiniDB synchronizes the active WAL and each resolved directory from the database directory up to the root. If any ancestor cannot be opened or its filesystem rejects directory synchronization, `open` returns the error. An orphan table, WAL, or staging file is disposable only after the manifest and its referenced files are loaded and the chosen directory state is synchronized. Obsolete-file cleanup is best effort and is retried on open.
 
@@ -49,4 +72,4 @@ Recovery replays only the active WAL, in file order, using the format's limits. 
 - A failed or interrupted mutation can be absent or can appear after reopen if its complete valid record reached the WAL. An append or sync error leaves the current MemTable untouched and stops further mutations on that handle until reopen.
 - An automatic flush happens after the mutation has been synchronized and applied. `Error::AutoFlushFailed` means that specific mutation is durable and visible. If the MemTable is still at or above the threshold on a subsequent valid mutation, MiniDB flushes before appending the new record. An error from this retry leaves the new mutation unapplied.
 - The directory is owned by one cooperative MiniDB handle at a time. Other programs must avoid editing, replacing, or deleting database files while MiniDB is using them.
-- The active WAL is append-only apart from incomplete-tail repair and is replaced on each nonempty flush. The MemTable threshold counts key bytes, current value bytes, and inline key and entry metadata. It is an estimate and excludes allocator and tree-node overhead. Without compaction, the number of retained table indexes grows with the number of flushes.
+- The active WAL is append-only apart from incomplete-tail repair and is replaced on each nonempty flush. The MemTable threshold counts key bytes, current value bytes, and inline key and entry metadata. It is an estimate and excludes allocator and tree-node overhead. The worker has a fixed fan-in of four and no rate limit. Under heavy flushing, the number of live tables can grow while the worker catches up. An output file can temporarily coexist with all inputs, and older data can be rewritten in successive merges.

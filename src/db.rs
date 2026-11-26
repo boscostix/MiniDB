@@ -1,16 +1,21 @@
 use std::{
-    cell::RefCell,
+    cell::Cell,
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io,
+    marker::PhantomData,
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    thread::{self, JoinHandle},
 };
 
 use crate::{
     Error, Options, Result,
+    compaction::{self, INPUT_COUNT},
     manifest::{self, Manifest},
     memtable::{Entry, MemTable},
     sstable::Sstable,
-    storage::{remove_file_if_exists, sync_directory},
+    storage::{remove_file_if_exists, staging_path, sync_directory},
     wal::Wal,
 };
 
@@ -22,8 +27,11 @@ pub struct MiniDB {
     options: Options,
     flush_threshold_bytes: usize,
     directory: PathBuf,
-    state: RefCell<State>,
-    // Keep the lock until after the WAL handle closes.
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
+    // Preserve the single-threaded public access contract.
+    _single_threaded: PhantomData<Cell<()>>,
+    // Keep the lock until after the worker and WAL handle close.
     _lock: File,
 }
 
@@ -31,8 +39,30 @@ struct State {
     memtable: MemTable,
     wal: Wal,
     manifest: Manifest,
-    tables: Vec<Sstable>,
+    tables: Arc<Vec<Arc<Sstable>>>,
+    last_file_id: u64,
     publication_uncertain: bool,
+    shutdown: bool,
+    compaction_error: Option<Error>,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    changed: Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionStage {
+    Merging,
+    BeforeManifestRename,
+    AfterManifestRename,
+    AfterManifestSync,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +110,15 @@ impl MiniDB {
         options: Options,
         flush_threshold_bytes: usize,
     ) -> Result<Self> {
+        Self::open_with_compaction_hook(path, options, flush_threshold_bytes, |_| Ok(()))
+    }
+
+    fn open_with_compaction_hook(
+        path: impl AsRef<Path>,
+        options: Options,
+        flush_threshold_bytes: usize,
+        hook: impl Fn(CompactionStage) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
         if !cfg!(unix) {
             return Err(Error::io(
                 "open database directory",
@@ -95,12 +134,23 @@ impl MiniDB {
             .canonicalize()
             .map_err(|error| Error::io("resolve database directory", error))?;
         let lock = lock_directory(&path)?;
-        let state = State::open(&path)?;
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::open(&path)?),
+            changed: Condvar::new(),
+        });
+        let worker_directory = path.clone();
+        let worker_state = Arc::clone(&shared);
+        let worker = thread::Builder::new()
+            .name("minidb-compaction".into())
+            .spawn(move || compact_in_background(&worker_directory, &worker_state, hook))
+            .map_err(|error| Error::io("start compaction worker", error))?;
         Ok(Self {
             options,
             flush_threshold_bytes,
             directory: path,
-            state: RefCell::new(state),
+            shared,
+            worker: Some(worker),
+            _single_threaded: PhantomData,
             _lock: lock,
         })
     }
@@ -126,15 +176,22 @@ impl MiniDB {
     ///
     /// Returns an error for an empty key or one exceeding the key size limit.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_with(key, || {})
+    }
+
+    fn get_with(&self, key: &[u8], on_snapshot: impl FnOnce()) -> Result<Option<Vec<u8>>> {
         self.validate_key(key)?;
-        let state = self.state.borrow();
+        let state = self.shared.lock();
         if let Some(entry) = state.memtable.get(key) {
             return Ok(match entry {
                 Entry::Value(value) => Some(value.clone()),
                 Entry::Tombstone => None,
             });
         }
-        for table in state.tables.iter().rev() {
+        let tables = Arc::clone(&state.tables);
+        drop(state);
+        on_snapshot();
+        for table in tables.iter().rev() {
             match table.get(key)? {
                 Some(Entry::Value(value)) => return Ok(Some(value)),
                 Some(Entry::Tombstone) => return Ok(None),
@@ -156,20 +213,46 @@ impl MiniDB {
     /// Persists the active MemTable as an immutable table and rotates its WAL.
     /// Flushing an empty, writable MemTable has no effect.
     pub fn flush(&self) -> Result<()> {
-        self.state.borrow_mut().flush(&self.directory)
+        self.flush_state(&mut self.shared.lock())
     }
 
-    /// Consumes the handle and releases the directory lock.
+    /// Returns the first background compaction error recorded on this handle.
+    ///
+    /// Compaction pauses on error until reopen. Errors before manifest replacement
+    /// permit foreground writes to continue.
+    pub fn compaction_error(&self) -> Option<Error> {
+        self.shared.lock().compaction_error.clone()
+    }
+
+    /// Stops compaction, joins any in-progress merge, and releases the directory lock.
     /// Successful mutations have already synchronized the WAL.
-    pub fn close(self) -> Result<()> {
+    ///
+    /// Returns a background compaction error if the worker encountered one.
+    pub fn close(mut self) -> Result<()> {
+        self.stop_worker()
+    }
+
+    fn stop_worker(&mut self) -> Result<()> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        self.shared.lock().shutdown = true;
+        self.shared.changed.notify_all();
+        worker.join().map_err(|_| Error::CompactionWorkerPanicked)?;
+        self.compaction_error().map_or(Ok(()), Err)
+    }
+
+    fn flush_state(&self, state: &mut State) -> Result<()> {
+        state.flush(&self.directory)?;
+        self.shared.changed.notify_one();
         Ok(())
     }
 
     fn mutate(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.shared.lock();
         state.ensure_writable()?;
         if state.should_flush(self.flush_threshold_bytes) {
-            state.flush(&self.directory)?;
+            self.flush_state(&mut state)?;
         }
 
         state.wal.append(key, value)?;
@@ -179,8 +262,7 @@ impl MiniDB {
         };
         state.memtable.insert(key, entry);
         if state.should_flush(self.flush_threshold_bytes) {
-            state
-                .flush(&self.directory)
+            self.flush_state(&mut state)
                 .map_err(|cause| Error::AutoFlushFailed {
                     cause: Box::new(cause),
                 })?;
@@ -203,6 +285,12 @@ impl MiniDB {
     }
 }
 
+impl Drop for MiniDB {
+    fn drop(&mut self) {
+        let _ = self.stop_worker();
+    }
+}
+
 impl State {
     fn open(directory: &Path) -> Result<Self> {
         let loaded = Manifest::load(directory)?;
@@ -212,7 +300,7 @@ impl State {
             let tables = manifest
                 .table_ids
                 .iter()
-                .map(|&id| Sstable::open(directory, id))
+                .map(|&id| Sstable::open(directory, id).map(Arc::new))
                 .collect::<Result<Vec<_>>>()?;
             let wal = Wal::open_existing(directory, manifest.generation, &mut memtable)?;
             (manifest, wal, tables)
@@ -237,9 +325,12 @@ impl State {
         Ok(Self {
             memtable,
             wal,
+            last_file_id: manifest.highest_file_id,
             manifest,
-            tables,
+            tables: Arc::new(tables),
             publication_uncertain: false,
+            shutdown: false,
+            compaction_error: None,
         })
     }
 
@@ -270,7 +361,7 @@ impl State {
         }
 
         let previous = self.manifest.generation;
-        let generation = previous.checked_add(1).ok_or(Error::GenerationExhausted)?;
+        let generation = next_file_id(self.last_file_id)?;
         let table = Sstable::create(directory, generation, &self.memtable, || {
             hook(FlushStage::ConstructingTable)
         })?;
@@ -279,6 +370,7 @@ impl State {
 
         let mut next = self.manifest.clone();
         next.generation = generation;
+        next.highest_file_id = generation;
         next.table_ids.push(generation);
         let staged = next.stage(directory)?;
         hook(FlushStage::BeforeManifestRename)?;
@@ -290,13 +382,106 @@ impl State {
         sync_directory(directory, "synchronize published manifest directory")?;
         hook(FlushStage::AfterManifestSync)?;
 
-        self.tables.push(table);
+        Arc::make_mut(&mut self.tables).push(Arc::new(table));
         self.wal = wal;
         self.manifest = next;
+        self.last_file_id = generation;
         self.memtable = MemTable::default();
         self.publication_uncertain = false;
         let _ = remove_file_if_exists(&Wal::path(directory, previous));
         Ok(())
+    }
+}
+
+fn compact_in_background(
+    directory: &Path,
+    shared: &Shared,
+    hook: impl Fn(CompactionStage) -> Result<()>,
+) {
+    let result = run_compaction(directory, shared, &hook);
+    if let Err(error) = result {
+        shared.lock().compaction_error = Some(error);
+        shared.changed.notify_all();
+    }
+}
+
+fn run_compaction(
+    directory: &Path,
+    shared: &Shared,
+    hook: &impl Fn(CompactionStage) -> Result<()>,
+) -> Result<()> {
+    loop {
+        let mut state = shared.lock();
+        while !state.shutdown && (state.publication_uncertain || state.tables.len() < INPUT_COUNT) {
+            state = shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if state.shutdown {
+            return Ok(());
+        }
+        let id = fresh_compaction_id(directory, state.last_file_id)?;
+        state.last_file_id = id;
+        let inputs = state.tables[..INPUT_COUNT].to_vec();
+        drop(state);
+
+        hook(CompactionStage::Merging)?;
+        let output = compaction::merge(directory, id, &inputs)?;
+        if output.is_some() {
+            sync_directory(directory, "synchronize compaction output file name")?;
+        }
+        let mut state = shared.lock();
+        if state.publication_uncertain {
+            return Err(Error::FlushRequiresReopen);
+        }
+
+        // A flush can only append tables, so the selected prefix is still the
+        // oldest. Its replacement goes before every table outside the merge.
+        let mut next = state.manifest.clone();
+        next.highest_file_id = state.last_file_id;
+        next.table_ids
+            .splice(..inputs.len(), output.iter().map(Sstable::id));
+        let staged = next.stage(directory)?;
+        hook(CompactionStage::BeforeManifestRename)?;
+        state.publication_uncertain = true;
+        Manifest::publish(directory, &staged)?;
+        hook(CompactionStage::AfterManifestRename)?;
+        sync_directory(directory, "synchronize compacted manifest directory")?;
+        hook(CompactionStage::AfterManifestSync)?;
+
+        Arc::make_mut(&mut state.tables).splice(..inputs.len(), output.map(Arc::new));
+        state.manifest = next;
+        state.publication_uncertain = false;
+        drop(state);
+        for table in &inputs {
+            table.retire();
+        }
+    }
+}
+
+fn next_file_id(last: u64) -> Result<u64> {
+    last.checked_add(1).ok_or(Error::GenerationExhausted)
+}
+
+fn fresh_compaction_id(directory: &Path, mut last: u64) -> Result<u64> {
+    // Recovery and failed flushes can leave artifacts outside the live
+    // manifest. Skip any such name when reserving a compaction output.
+    loop {
+        let id = next_file_id(last)?;
+        let path = Sstable::path(directory, id);
+        if !file_name_exists(&path)? && !file_name_exists(&staging_path(&path))? {
+            return Ok(id);
+        }
+        last = id;
+    }
+}
+
+fn file_name_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::io("inspect compaction output name", error)),
     }
 }
 
@@ -320,6 +505,7 @@ fn remove_unreferenced_files(directory: &Path, manifest: &Manifest) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
+    let live_table_ids: HashSet<_> = manifest.table_ids.iter().copied().collect();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -332,8 +518,7 @@ fn remove_unreferenced_files(directory: &Path, manifest: &Manifest) {
             None => {
                 (name == "wal.log" && manifest.generation != 0)
                     || Wal::numbered_id(name).is_some_and(|id| id != manifest.generation)
-                    || Sstable::numbered_id(name)
-                        .is_some_and(|id| manifest.table_ids.binary_search(&id).is_err())
+                    || Sstable::numbered_id(name).is_some_and(|id| !live_table_ids.contains(&id))
             }
         };
         if obsolete {
@@ -454,8 +639,8 @@ mod tests {
             stage => panic!("unknown checkpoint {stage}"),
         };
         let db = MiniDB::open(directory).unwrap();
-        db.state
-            .borrow_mut()
+        db.shared
+            .lock()
             .flush_with(
                 &db.directory,
                 |stage| {
@@ -476,7 +661,7 @@ mod tests {
         let path = directory.path();
         let db = MiniDB::open(path).unwrap();
         db.put(b"old", b"durable").unwrap();
-        let error = db.state.borrow_mut().flush_with(
+        let error = db.shared.lock().flush_with(
             &db.directory,
             |stage| {
                 if stage == FlushStage::AfterManifestRename {
@@ -514,7 +699,7 @@ mod tests {
         let db = MiniDB::open(path).unwrap();
         db.put(b"first", b"durable").unwrap();
 
-        let error = db.state.borrow_mut().flush_with(
+        let error = db.shared.lock().flush_with(
             &db.directory,
             |stage| {
                 if stage == FlushStage::BeforeManifestRename {
@@ -539,7 +724,7 @@ mod tests {
         let old_wal = Wal::path(path, 0);
         let contents = fs::read(&old_wal).unwrap();
 
-        let error = db.state.borrow_mut().flush_with(
+        let error = db.shared.lock().flush_with(
             &db.directory,
             |_| Ok(()),
             |directory, staged| {
@@ -577,3 +762,6 @@ mod tests {
         assert_eq!(db.get(b"third").unwrap(), None);
     }
 }
+
+#[cfg(all(test, unix))]
+mod compaction_tests;

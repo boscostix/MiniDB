@@ -32,12 +32,14 @@ pub enum Error {
     CorruptManifest { reason: &'static str },
     /// An immutable table contains invalid metadata or block data.
     CorruptSstable { id: u64, reason: &'static str },
-    /// The next flush generation cannot be represented.
+    /// The next storage file ID cannot be represented.
     GenerationExhausted,
     /// Manifest replacement or synchronization failed. Reopen before writing.
     FlushRequiresReopen,
     /// A mutation is durable and visible, but its automatic flush failed.
     AutoFlushFailed { cause: Box<Error> },
+    /// The background compaction thread exited unexpectedly.
+    CompactionWorkerPanicked,
 }
 
 impl Error {
@@ -80,10 +82,11 @@ impl fmt::Display for Error {
             }
             Self::CorruptManifest { reason } => write!(f, "corrupt manifest: {reason}"),
             Self::CorruptSstable { id, reason } => write!(f, "corrupt SSTable {id}: {reason}"),
-            Self::GenerationExhausted => f.write_str("SSTable generation space is exhausted"),
+            Self::GenerationExhausted => f.write_str("storage file ID space is exhausted"),
             Self::FlushRequiresReopen => {
                 f.write_str("reopen the database after uncertain manifest publication")
             }
+            Self::CompactionWorkerPanicked => f.write_str("background compaction worker panicked"),
             Self::AutoFlushFailed { cause } => {
                 write!(
                     f,

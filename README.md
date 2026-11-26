@@ -1,6 +1,6 @@
 # MiniDB
 
-MiniDB is a Rust embedded key-value engine. Milestone 3 adds immutable sorted tables (SSTables), a durable manifest, and WAL rotation to the in-memory MemTable and write-ahead log (WAL). The crate requires Rust 1.88 or newer. Opening a database requires Unix advisory file locking and permission to open and synchronize the resolved database directory and every ancestor up to the root. Each of those directories must support directory synchronization.
+MiniDB is a Rust embedded key-value engine. It uses an in-memory MemTable, a write-ahead log (WAL), immutable sorted tables (SSTables), and a durable manifest. Milestone 4 adds background SSTable compaction. The crate requires Rust 1.88 or newer. Opening a database requires Unix advisory file locking and permission to open and synchronize the resolved database directory and every ancestor up to the root. Each of those directories must support directory synchronization.
 
 ## Usage
 
@@ -30,7 +30,11 @@ Keys and values can contain arbitrary bytes. Keys must have at least one byte, a
 
 Each `put` or `delete` synchronizes the WAL record before changing the MemTable. `flush` synchronously persists the active MemTable to an SSTable and rotates the WAL. A write that reaches the threshold attempts this flush immediately. `Error::AutoFlushFailed` means the mutation is already durable and visible, and its automatic flush failed. A later valid mutation retries any over-threshold MemTable before appending its own record. A single large entry can exceed the threshold until it is flushed.
 
-A `RefCell` provides single-threaded access through `&self`. The handle retains the active MemTable and one in-memory index per live table. A lookup opens an SSTable only while reading its candidate block. Without compaction, table count grows with each nonempty flush. See the [storage format and durability model](docs/storage_format.md) for publication order, error recovery, and compatibility details.
+The public handle remains single-threaded. It keeps the active MemTable and one in-memory index per live table. A lookup opens an SSTable only while reading its candidate block. Lookup snapshots keep old files available until in-flight reads finish.
+
+When at least four tables are live, a single background worker merges the four oldest tables. It keeps the newest entry for each key and removes tombstones whose older values were all covered by the merge. Reads and foreground flushes can proceed during the merge. The worker publishes through the durable manifest and leaves all tables outside the merge newer than the output. MiniDB can open Milestone 3 databases with version 1 manifests. New manifest publications use version 2.
+
+A compaction error stops the worker for that handle. `compaction_error` reports the error once recorded, and `close` returns it after joining the worker. An error during manifest replacement or its directory sync also blocks further mutations and flushes until reopen. Both `close` and `Drop` wait for an ongoing merge before releasing the directory lock. Queued merges can wait until the next open. Compaction can fall behind flushes and can repeatedly rewrite old data. See the [storage format and durability model](docs/storage_format.md) for publication and recovery details.
 
 ## Verification
 
@@ -38,4 +42,5 @@ A `RefCell` provides single-threaded access through `&self`. The handle retains 
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
+cargo +1.88.0 test --locked
 ```

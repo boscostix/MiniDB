@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
@@ -12,12 +13,14 @@ use crate::{
 };
 
 const NAME: &str = "MANIFEST";
-const HEADER: [u8; 8] = *b"MINIMAN\x01";
+const HEADER_V1: [u8; 8] = *b"MINIMAN\x01";
+const HEADER_V2: [u8; 8] = *b"MINIMAN\x02";
 const IO_READ: &str = "read manifest";
 
 #[derive(Clone, Default)]
 pub(crate) struct Manifest {
     pub(crate) generation: u64,
+    pub(crate) highest_file_id: u64,
     pub(crate) table_ids: Vec<u64>,
 }
 
@@ -37,26 +40,49 @@ impl Manifest {
         }
         let mut reader = BufReader::new(file);
         let header = read_array::<8>(&mut reader, IO_READ)?;
-        if header != HEADER {
-            return Err(corrupt("invalid magic or unsupported version"));
+        let fixed_len = match header {
+            HEADER_V1 => 28,
+            HEADER_V2 => 36,
+            _ => return Err(corrupt("invalid magic or unsupported version")),
+        };
+        if len < fixed_len {
+            return Err(corrupt("invalid file length"));
         }
+        let mut crc = Hasher::new();
+        crc.update(&header);
         let raw_generation = read_array(&mut reader, IO_READ)?;
-        let raw_count = read_array(&mut reader, IO_READ)?;
+        crc.update(&raw_generation);
         let generation = u64::from_le_bytes(raw_generation);
+        let highest_file_id = if header == HEADER_V2 {
+            let raw_id = read_array(&mut reader, IO_READ)?;
+            crc.update(&raw_id);
+            u64::from_le_bytes(raw_id)
+        } else {
+            generation
+        };
+        if generation > highest_file_id {
+            return Err(corrupt("WAL generation exceeds file ID watermark"));
+        }
+        let raw_count = read_array(&mut reader, IO_READ)?;
+        crc.update(&raw_count);
         let count = u64::from_le_bytes(raw_count);
-        if count != (len - 28) / 8 || count > generation {
+        if count != (len - fixed_len) / 8
+            || count > highest_file_id
+            || (generation == 0 && count != 0)
+        {
             return Err(corrupt("invalid table count"));
         }
 
-        let mut crc = Hasher::new();
-        crc.update(&header);
-        crc.update(&raw_generation);
-        crc.update(&raw_count);
+        let mut seen = HashSet::new();
         let mut table_ids = Vec::new();
         for _ in 0..count {
             let raw_id = read_array(&mut reader, IO_READ)?;
             let id = u64::from_le_bytes(raw_id);
-            if id <= table_ids.last().copied().unwrap_or(0) || id > generation {
+            if id == 0
+                || id > highest_file_id
+                || !seen.insert(id)
+                || (header == HEADER_V1 && id <= table_ids.last().copied().unwrap_or(0))
+            {
                 return Err(corrupt("invalid table generation or ordering"));
             }
             crc.update(&raw_id);
@@ -68,6 +94,7 @@ impl Manifest {
         }
         Ok(Some(Self {
             generation,
+            highest_file_id,
             table_ids,
         }))
     }
@@ -80,8 +107,10 @@ impl Manifest {
             crc.update(bytes);
             writer.write_all(bytes)
         };
-        write(&HEADER).map_err(|error| Error::io("write manifest", error))?;
+        write(&HEADER_V2).map_err(|error| Error::io("write manifest", error))?;
         write(&self.generation.to_le_bytes())
+            .map_err(|error| Error::io("write manifest", error))?;
+        write(&self.highest_file_id.to_le_bytes())
             .map_err(|error| Error::io("write manifest", error))?;
         write(&(self.table_ids.len() as u64).to_le_bytes())
             .map_err(|error| Error::io("write manifest", error))?;
