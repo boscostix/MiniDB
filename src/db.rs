@@ -1,11 +1,12 @@
 use std::{
-    cell::Cell,
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io,
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    path::Path,
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        mpsc,
+    },
     thread::{self, JoinHandle},
 };
 
@@ -16,44 +17,62 @@ use crate::{
     memtable::{Entry, MemTable},
     sstable::Sstable,
     storage::{remove_file_if_exists, staging_path, sync_directory},
-    wal::Wal,
+    wal::{Wal, WalStage},
 };
 
 const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
 
 /// An exclusively opened database with durable writes and indexed disk tables.
-/// A handle is intended for use by one thread at a time.
+/// Share a handle with `Arc<MiniDB>` for concurrent point reads and writes.
+/// Mutations are serialized and become visible after WAL synchronization.
 pub struct MiniDB {
     options: Options,
     flush_threshold_bytes: usize,
-    directory: PathBuf,
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
-    // Preserve the single-threaded public access contract.
-    _single_threaded: PhantomData<Cell<()>>,
-    // Keep the lock until after the worker and WAL handle close.
+    writers: Mutex<()>,
+    flush_requests: Option<mpsc::Sender<FlushRequest>>,
+    flush_worker: Option<JoinHandle<()>>,
+    compaction_worker: Option<JoinHandle<()>>,
+    // Keep the lock until after the workers and WAL handle close.
     _lock: File,
 }
 
 struct State {
-    memtable: MemTable,
     wal: Wal,
     manifest: Manifest,
-    tables: Arc<Vec<Arc<Sstable>>>,
     last_file_id: u64,
     publication_uncertain: bool,
     shutdown: bool,
     compaction_error: Option<Error>,
+    flush_worker_failed: bool,
+}
+
+struct ReadView {
+    memtable: Arc<MemTable>,
+    tables: Arc<Vec<Arc<Sstable>>>,
 }
 
 struct Shared {
+    // Persistence operations take the state lock before taking the view lock.
+    // Readers take only the view lock, and never hold it during file I/O.
     state: Mutex<State>,
+    view: RwLock<ReadView>,
     changed: Condvar,
 }
+
+type FlushRequest = mpsc::Sender<Result<()>>;
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn read_view(&self) -> RwLockReadGuard<'_, ReadView> {
+        self.view.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_view(&self) -> RwLockWriteGuard<'_, ReadView> {
+        self.view.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -65,9 +84,10 @@ enum CompactionStage {
     AfterManifestSync,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlushStage {
     ConstructingTable,
+    AfterFilesSync,
     BeforeManifestRename,
     AfterManifestRename,
     AfterManifestSync,
@@ -110,14 +130,15 @@ impl MiniDB {
         options: Options,
         flush_threshold_bytes: usize,
     ) -> Result<Self> {
-        Self::open_with_compaction_hook(path, options, flush_threshold_bytes, |_| Ok(()))
+        Self::open_with_hooks(path, options, flush_threshold_bytes, |_| Ok(()), |_| Ok(()))
     }
 
-    fn open_with_compaction_hook(
+    fn open_with_hooks(
         path: impl AsRef<Path>,
         options: Options,
         flush_threshold_bytes: usize,
-        hook: impl Fn(CompactionStage) -> Result<()> + Send + 'static,
+        flush_hook: impl Fn(FlushStage) -> Result<()> + Send + 'static,
+        compaction_hook: impl Fn(CompactionStage) -> Result<()> + Send + 'static,
     ) -> Result<Self> {
         if !cfg!(unix) {
             return Err(Error::io(
@@ -134,25 +155,38 @@ impl MiniDB {
             .canonicalize()
             .map_err(|error| Error::io("resolve database directory", error))?;
         let lock = lock_directory(&path)?;
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State::open(&path)?),
-            changed: Condvar::new(),
-        });
+        let shared = Arc::new(Shared::open(&path)?);
+        let (flush_requests, requests) = mpsc::channel::<FlushRequest>();
         let worker_directory = path.clone();
         let worker_state = Arc::clone(&shared);
-        let worker = thread::Builder::new()
-            .name("minidb-compaction".into())
-            .spawn(move || compact_in_background(&worker_directory, &worker_state, hook))
-            .map_err(|error| Error::io("start compaction worker", error))?;
-        Ok(Self {
+        let flush_worker = thread::Builder::new()
+            .name("minidb-flush".into())
+            .spawn(move || {
+                for respond in requests {
+                    let result =
+                        worker_state.flush_with(&worker_directory, &flush_hook, Manifest::publish);
+                    let _ = respond.send(result);
+                }
+            })
+            .map_err(|error| Error::io("start flush worker", error))?;
+        let mut db = Self {
             options,
             flush_threshold_bytes,
-            directory: path,
             shared,
-            worker: Some(worker),
-            _single_threaded: PhantomData,
+            writers: Mutex::new(()),
+            flush_requests: Some(flush_requests),
+            flush_worker: Some(flush_worker),
+            compaction_worker: None,
             _lock: lock,
-        })
+        };
+        let worker_state = Arc::clone(&db.shared);
+        db.compaction_worker = Some(
+            thread::Builder::new()
+                .name("minidb-compaction".into())
+                .spawn(move || compact_in_background(&path, &worker_state, compaction_hook))
+                .map_err(|error| Error::io("start compaction worker", error))?,
+        );
+        Ok(db)
     }
 
     /// Inserts or replaces a value. Empty values are valid.
@@ -181,15 +215,15 @@ impl MiniDB {
 
     fn get_with(&self, key: &[u8], on_snapshot: impl FnOnce()) -> Result<Option<Vec<u8>>> {
         self.validate_key(key)?;
-        let state = self.shared.lock();
-        if let Some(entry) = state.memtable.get(key) {
+        let view = self.shared.read_view();
+        if let Some(entry) = view.memtable.get(key) {
             return Ok(match entry {
                 Entry::Value(value) => Some(value.clone()),
                 Entry::Tombstone => None,
             });
         }
-        let tables = Arc::clone(&state.tables);
-        drop(state);
+        let tables = Arc::clone(&view.tables);
+        drop(view);
         on_snapshot();
         for table in tables.iter().rev() {
             match table.get(key)? {
@@ -211,9 +245,10 @@ impl MiniDB {
     }
 
     /// Persists the active MemTable as an immutable table and rotates its WAL.
-    /// Flushing an empty, writable MemTable has no effect.
+    /// Waits for the flush worker. Flushing an empty, writable MemTable has no effect.
     pub fn flush(&self) -> Result<()> {
-        self.flush_state(&mut self.shared.lock())
+        let _writer = self.lock_writer()?;
+        self.request_flush()
     }
 
     /// Returns the first background compaction error recorded on this handle.
@@ -224,50 +259,101 @@ impl MiniDB {
         self.shared.lock().compaction_error.clone()
     }
 
-    /// Stops compaction, joins any in-progress merge, and releases the directory lock.
+    /// Joins the background workers and releases the directory lock.
     /// Successful mutations have already synchronized the WAL.
     ///
-    /// Returns a background compaction error if the worker encountered one.
+    /// Returns a worker panic or a recorded compaction error. When sharing via
+    /// `Arc`, recover ownership of the handle before calling this method.
     pub fn close(mut self) -> Result<()> {
-        self.stop_worker()
+        self.stop_workers()
     }
 
-    fn stop_worker(&mut self) -> Result<()> {
-        let Some(worker) = self.worker.take() else {
+    fn stop_workers(&mut self) -> Result<()> {
+        let flush_worker = self.flush_worker.take();
+        let compaction_worker = self.compaction_worker.take();
+        if flush_worker.is_none() && compaction_worker.is_none() {
             return Ok(());
-        };
+        }
         self.shared.lock().shutdown = true;
         self.shared.changed.notify_all();
-        worker.join().map_err(|_| Error::CompactionWorkerPanicked)?;
+        self.flush_requests.take();
+        let flush_panicked = flush_worker.is_some_and(|worker| worker.join().is_err());
+        let compaction_panicked = compaction_worker.is_some_and(|worker| worker.join().is_err());
+        if flush_panicked {
+            return Err(Error::FlushWorkerPanicked);
+        }
+        if compaction_panicked {
+            return Err(Error::CompactionWorkerPanicked);
+        }
         self.compaction_error().map_or(Ok(()), Err)
     }
 
-    fn flush_state(&self, state: &mut State) -> Result<()> {
-        state.flush(&self.directory)?;
-        self.shared.changed.notify_one();
-        Ok(())
+    fn lock_writer(&self) -> Result<MutexGuard<'_, ()>> {
+        self.writers.lock().map_err(|_| Error::FlushRequiresReopen)
+    }
+
+    // The initiating caller holds the writer gate until it receives this result.
+    // The worker never takes that gate and receives at most one pending request.
+    fn request_flush(&self) -> Result<()> {
+        let (respond, result) = mpsc::channel();
+        let requests = self
+            .flush_requests
+            .as_ref()
+            .expect("open flush request channel");
+        if requests.send(respond).is_ok()
+            && let Ok(result) = result.recv()
+        {
+            return result;
+        }
+
+        self.shared.lock().flush_worker_failed = true;
+        Err(Error::FlushWorkerPanicked)
     }
 
     fn mutate(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        self.mutate_with(key, value, |_| Ok(()))
+    }
+
+    fn mutate_with(
+        &self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        wal_hook: impl FnMut(WalStage) -> io::Result<()>,
+    ) -> Result<()> {
+        let _writer = self.lock_writer()?;
         let mut state = self.shared.lock();
         state.ensure_writable()?;
-        if state.should_flush(self.flush_threshold_bytes) {
-            self.flush_state(&mut state)?;
+        if self.should_flush() {
+            drop(state);
+            self.request_flush()?;
+            state = self.shared.lock();
+            state.ensure_writable()?;
         }
 
-        state.wal.append(key, value)?;
         let entry = match value {
             Some(value) => Entry::Value(value.to_vec()),
             None => Entry::Tombstone,
         };
-        state.memtable.insert(key, entry);
-        if state.should_flush(self.flush_threshold_bytes) {
-            self.flush_state(&mut state)
+        state.wal.append_with(key, value, wal_hook)?;
+        {
+            let mut view = self.shared.write_view();
+            Arc::get_mut(&mut view.memtable)
+                .expect("writers are serialized with flush")
+                .insert(key, entry);
+        }
+        drop(state);
+        if self.should_flush() {
+            self.request_flush()
                 .map_err(|cause| Error::AutoFlushFailed {
                     cause: Box::new(cause),
                 })?;
         }
         Ok(())
+    }
+
+    fn should_flush(&self) -> bool {
+        let view = self.shared.read_view();
+        !view.memtable.is_empty() && view.memtable.approximate_bytes() >= self.flush_threshold_bytes
     }
 
     fn validate_key(&self, key: &[u8]) -> Result<()> {
@@ -287,11 +373,11 @@ impl MiniDB {
 
 impl Drop for MiniDB {
     fn drop(&mut self) {
-        let _ = self.stop_worker();
+        let _ = self.stop_workers();
     }
 }
 
-impl State {
+impl Shared {
     fn open(directory: &Path) -> Result<Self> {
         let loaded = Manifest::load(directory)?;
         let needs_manifest = loaded.is_none();
@@ -323,52 +409,46 @@ impl State {
         remove_unreferenced_files(directory, &manifest);
 
         Ok(Self {
-            memtable,
-            wal,
-            last_file_id: manifest.highest_file_id,
-            manifest,
-            tables: Arc::new(tables),
-            publication_uncertain: false,
-            shutdown: false,
-            compaction_error: None,
+            state: Mutex::new(State {
+                wal,
+                last_file_id: manifest.highest_file_id,
+                manifest,
+                publication_uncertain: false,
+                shutdown: false,
+                compaction_error: None,
+                flush_worker_failed: false,
+            }),
+            view: RwLock::new(ReadView {
+                memtable: Arc::new(memtable),
+                tables: Arc::new(tables),
+            }),
+            changed: Condvar::new(),
         })
     }
 
-    fn ensure_writable(&self) -> Result<()> {
-        if self.publication_uncertain {
-            return Err(Error::FlushRequiresReopen);
-        }
-        self.wal.ensure_writable()
-    }
-
-    fn should_flush(&self, threshold: usize) -> bool {
-        !self.memtable.is_empty() && self.memtable.approximate_bytes() >= threshold
-    }
-
-    fn flush(&mut self, directory: &Path) -> Result<()> {
-        self.flush_with(directory, |_| Ok(()), Manifest::publish)
-    }
-
     fn flush_with(
-        &mut self,
+        &self,
         directory: &Path,
         hook: impl Fn(FlushStage) -> Result<()>,
         publish_manifest: impl FnOnce(&Path, &Path) -> Result<()>,
     ) -> Result<()> {
-        self.ensure_writable()?;
-        if self.memtable.is_empty() {
+        let mut state = self.lock();
+        state.ensure_writable()?;
+        let memtable = Arc::clone(&self.read_view().memtable);
+        if memtable.is_empty() {
             return Ok(());
         }
 
-        let previous = self.manifest.generation;
-        let generation = next_file_id(self.last_file_id)?;
-        let table = Sstable::create(directory, generation, &self.memtable, || {
+        let previous = state.manifest.generation;
+        let generation = next_file_id(state.last_file_id)?;
+        let table = Sstable::create(directory, generation, &memtable, || {
             hook(FlushStage::ConstructingTable)
         })?;
         let wal = Wal::create(directory, generation)?;
         sync_directory(directory, "synchronize flush file names")?;
+        hook(FlushStage::AfterFilesSync)?;
 
-        let mut next = self.manifest.clone();
+        let mut next = state.manifest.clone();
         next.generation = generation;
         next.highest_file_id = generation;
         next.table_ids.push(generation);
@@ -376,20 +456,36 @@ impl State {
         hook(FlushStage::BeforeManifestRename)?;
         // A rename error can leave the replacement visible. Keep both generations
         // and reject later writes until the directory selection is resolved on open.
-        self.publication_uncertain = true;
+        state.publication_uncertain = true;
         publish_manifest(directory, &staged)?;
         hook(FlushStage::AfterManifestRename)?;
         sync_directory(directory, "synchronize published manifest directory")?;
         hook(FlushStage::AfterManifestSync)?;
 
-        Arc::make_mut(&mut self.tables).push(Arc::new(table));
-        self.wal = wal;
-        self.manifest = next;
-        self.last_file_id = generation;
-        self.memtable = MemTable::default();
-        self.publication_uncertain = false;
+        {
+            let mut view = self.write_view();
+            Arc::make_mut(&mut view.tables).push(Arc::new(table));
+            view.memtable = Arc::default();
+        }
+        state.wal = wal;
+        state.manifest = next;
+        state.last_file_id = generation;
+        state.publication_uncertain = false;
+        self.changed.notify_one();
         let _ = remove_file_if_exists(&Wal::path(directory, previous));
         Ok(())
+    }
+}
+
+impl State {
+    fn ensure_writable(&self) -> Result<()> {
+        if self.publication_uncertain {
+            return Err(Error::FlushRequiresReopen);
+        }
+        if self.flush_worker_failed {
+            return Err(Error::FlushWorkerPanicked);
+        }
+        self.wal.ensure_writable()
     }
 }
 
@@ -412,7 +508,9 @@ fn run_compaction(
 ) -> Result<()> {
     loop {
         let mut state = shared.lock();
-        while !state.shutdown && (state.publication_uncertain || state.tables.len() < INPUT_COUNT) {
+        while !state.shutdown
+            && (state.publication_uncertain || state.manifest.table_ids.len() < INPUT_COUNT)
+        {
             state = shared
                 .changed
                 .wait(state)
@@ -423,7 +521,7 @@ fn run_compaction(
         }
         let id = fresh_compaction_id(directory, state.last_file_id)?;
         state.last_file_id = id;
-        let inputs = state.tables[..INPUT_COUNT].to_vec();
+        let inputs = shared.read_view().tables[..INPUT_COUNT].to_vec();
         drop(state);
 
         hook(CompactionStage::Merging)?;
@@ -450,7 +548,7 @@ fn run_compaction(
         sync_directory(directory, "synchronize compacted manifest directory")?;
         hook(CompactionStage::AfterManifestSync)?;
 
-        Arc::make_mut(&mut state.tables).splice(..inputs.len(), output.map(Arc::new));
+        Arc::make_mut(&mut shared.write_view().tables).splice(..inputs.len(), output.map(Arc::new));
         state.manifest = next;
         state.publication_uncertain = false;
         drop(state);
@@ -638,20 +736,20 @@ mod tests {
             "after-sync" => FlushStage::AfterManifestSync,
             stage => panic!("unknown checkpoint {stage}"),
         };
-        let db = MiniDB::open(directory).unwrap();
-        db.shared
-            .lock()
-            .flush_with(
-                &db.directory,
-                |stage| {
-                    if stage == checkpoint {
-                        std::process::exit(CRASH_CODE);
-                    }
-                    Ok(())
-                },
-                Manifest::publish,
-            )
-            .unwrap();
+        let db = MiniDB::open_with_hooks(
+            directory,
+            Options::default(),
+            DEFAULT_FLUSH_THRESHOLD_BYTES,
+            move |stage| {
+                if stage == checkpoint {
+                    std::process::exit(CRASH_CODE);
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        db.flush().unwrap();
         panic!("checkpoint not reached");
     }
 
@@ -661,8 +759,8 @@ mod tests {
         let path = directory.path();
         let db = MiniDB::open(path).unwrap();
         db.put(b"old", b"durable").unwrap();
-        let error = db.shared.lock().flush_with(
-            &db.directory,
+        let error = db.shared.flush_with(
+            path,
             |stage| {
                 if stage == FlushStage::AfterManifestRename {
                     return Err(Error::io(
@@ -699,8 +797,8 @@ mod tests {
         let db = MiniDB::open(path).unwrap();
         db.put(b"first", b"durable").unwrap();
 
-        let error = db.shared.lock().flush_with(
-            &db.directory,
+        let error = db.shared.flush_with(
+            path,
             |stage| {
                 if stage == FlushStage::BeforeManifestRename {
                     return Err(Error::io(
@@ -724,8 +822,8 @@ mod tests {
         let old_wal = Wal::path(path, 0);
         let contents = fs::read(&old_wal).unwrap();
 
-        let error = db.shared.lock().flush_with(
-            &db.directory,
+        let error = db.shared.flush_with(
+            path,
             |_| Ok(()),
             |directory, staged| {
                 Manifest::publish(directory, staged)?;
@@ -765,3 +863,9 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod compaction_tests;
+
+#[cfg(all(test, unix))]
+mod concurrency_tests;
+
+#[cfg(all(test, unix))]
+mod reliability_tests;

@@ -11,19 +11,21 @@ fn open_with_hook(
     path: &Path,
     hook: impl Fn(CompactionStage) -> Result<()> + Send + 'static,
 ) -> MiniDB {
-    MiniDB::open_with_compaction_hook(
+    MiniDB::open_with_hooks(
         path,
         Options::default(),
         DEFAULT_FLUSH_THRESHOLD_BYTES,
+        |_| Ok(()),
         hook,
     )
     .unwrap()
 }
 
 fn create_input_tables(path: &Path, count: u64) {
-    let mut state = State::open(path).unwrap();
+    let shared = Shared::open(path).unwrap();
     for id in 1..=count {
-        let table = &mut state.memtable;
+        let mut view = shared.write_view();
+        let table = Arc::get_mut(&mut view.memtable).unwrap();
         table.insert(b"shared", Entry::Value(vec![id as u8; 6000]));
         table.insert([0, id as u8, 255], Entry::Value(vec![id as u8; 4096]));
         match id {
@@ -37,7 +39,10 @@ fn create_input_tables(path: &Path, count: u64) {
             5 => table.insert(b"suffix-deleted", Entry::Tombstone),
             _ => {}
         }
-        state.flush(path).unwrap();
+        drop(view);
+        shared
+            .flush_with(path, |_| Ok(()), Manifest::publish)
+            .unwrap();
     }
 
     // Encode the equivalent legacy manifest, including its original checksum.
@@ -343,5 +348,45 @@ fn drop_joins_an_active_worker_before_releasing_the_directory_lock() {
     closing.join().unwrap();
     assert_eq!(live_ids(path), [5]);
     let db = MiniDB::open(path).unwrap();
+    assert_eq!(db.get(b"shared").unwrap(), Some(vec![4; 6000]));
+}
+
+#[test]
+fn concurrent_readers_progress_while_compaction_publishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    create_input_tables(path, 4);
+    let (renamed, publication) = mpsc::channel();
+    let (resume, paused) = mpsc::channel();
+    let db = Arc::new(open_with_hook(path, move |stage| {
+        if stage == CompactionStage::AfterManifestRename {
+            renamed.send(()).unwrap();
+            paused.recv_timeout(WAIT).unwrap();
+        }
+        Ok(())
+    }));
+    publication.recv_timeout(WAIT).unwrap();
+
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                assert_eq!(
+                    db.get(b"pin").unwrap().as_deref(),
+                    Some(&b"old snapshot"[..])
+                );
+                assert_eq!(db.get(b"discarded").unwrap(), None);
+                assert_eq!(db.get(b"shared").unwrap(), Some(vec![4; 6000]));
+            })
+        })
+        .collect();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    resume.send(()).unwrap();
+    Arc::into_inner(db).unwrap().close().unwrap();
+
+    let db = MiniDB::open(path).unwrap();
+    assert_eq!(live_ids(path), [5]);
     assert_eq!(db.get(b"shared").unwrap(), Some(vec![4; 6000]));
 }

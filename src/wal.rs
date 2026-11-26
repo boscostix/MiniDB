@@ -22,6 +22,13 @@ const RECORD_HEADER_LEN: usize = RECORD_FIELDS_LEN + CHECKSUM_LEN;
 const PUT: u8 = 1;
 const DELETE: u8 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalStage {
+    HeaderWritten,
+    BeforeSync,
+    AfterSync,
+}
+
 pub(crate) struct Wal {
     file: File,
     write_failed: bool,
@@ -101,14 +108,20 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn append(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        self.append_and_sync(key, value, File::sync_all)
+    pub(crate) fn append_with(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        hook: impl FnMut(WalStage) -> io::Result<()>,
+    ) -> Result<()> {
+        self.append_and_sync(key, value, hook, File::sync_all)
     }
 
     fn append_and_sync(
         &mut self,
         key: &[u8],
         value: Option<&[u8]>,
+        mut hook: impl FnMut(WalStage) -> io::Result<()>,
         sync: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<()> {
         self.ensure_writable()?;
@@ -130,18 +143,23 @@ impl Wal {
         let header_crc = crc32fast::hash(&header[..RECORD_FIELDS_LEN]);
         header[RECORD_FIELDS_LEN..].copy_from_slice(&header_crc.to_le_bytes());
 
+        // Until append and sync both succeed, the on-disk tail is uncertain.
+        self.write_failed = true;
         let result = self
             .file
             .write_all(&header)
+            .and_then(|()| hook(WalStage::HeaderWritten))
             .and_then(|()| self.file.write_all(key))
             .and_then(|()| self.file.write_all(value))
             .and_then(|()| self.file.write_all(&payload_crc(key, value)))
             .map_err(|error| Error::io("append WAL record", error))
             .and_then(|()| {
-                sync(&self.file).map_err(|error| Error::io("synchronize WAL record", error))
+                hook(WalStage::BeforeSync)
+                    .and_then(|()| sync(&self.file))
+                    .and_then(|()| hook(WalStage::AfterSync))
+                    .map_err(|error| Error::io("synchronize WAL record", error))
             });
 
-        // The last record's on-disk state is unknown after either failure.
         self.write_failed = result.is_err();
         result
     }
@@ -267,13 +285,16 @@ mod tests {
         wal.file = File::open(directory.path().join(WAL_NAME)).unwrap();
 
         assert!(matches!(
-            wal.append(b"key", Some(b"value")),
+            wal.append_with(b"key", Some(b"value"), |_| Ok(())),
             Err(Error::Io {
                 operation: "append WAL record",
                 ..
             })
         ));
-        assert_eq!(wal.append(b"key", None), Err(Error::WalWriteFailed));
+        assert_eq!(
+            wal.append_with(b"key", None, |_| Ok(())),
+            Err(Error::WalWriteFailed)
+        );
     }
 
     #[test]
@@ -282,14 +303,20 @@ mod tests {
         let mut wal = Wal::open_legacy(directory.path(), &mut MemTable::default()).unwrap();
 
         assert!(matches!(
-            wal.append_and_sync(b"key", Some(b"value"), |_| {
-                Err(io::Error::other("simulated synchronization failure"))
-            }),
+            wal.append_and_sync(
+                b"key",
+                Some(b"value"),
+                |_| Ok(()),
+                |_| { Err(io::Error::other("simulated synchronization failure")) }
+            ),
             Err(Error::Io {
                 operation: "synchronize WAL record",
                 ..
             })
         ));
-        assert_eq!(wal.append(b"key", None), Err(Error::WalWriteFailed));
+        assert_eq!(
+            wal.append_with(b"key", None, |_| Ok(())),
+            Err(Error::WalWriteFailed)
+        );
     }
 }

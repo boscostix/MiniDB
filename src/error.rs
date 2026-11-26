@@ -38,6 +38,8 @@ pub enum Error {
     FlushRequiresReopen,
     /// A mutation is durable and visible, but its automatic flush failed.
     AutoFlushFailed { cause: Box<Error> },
+    /// The background flush thread exited unexpectedly.
+    FlushWorkerPanicked,
     /// The background compaction thread exited unexpectedly.
     CompactionWorkerPanicked,
 }
@@ -86,6 +88,7 @@ impl fmt::Display for Error {
             Self::FlushRequiresReopen => {
                 f.write_str("reopen the database after uncertain manifest publication")
             }
+            Self::FlushWorkerPanicked => f.write_str("background flush worker panicked"),
             Self::CompactionWorkerPanicked => f.write_str("background compaction worker panicked"),
             Self::AutoFlushFailed { cause } => {
                 write!(
