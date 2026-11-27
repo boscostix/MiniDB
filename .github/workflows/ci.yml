@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, 1.88.0]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select Rust toolchain
+        run: rustup toolchain install "${{ matrix.rust }}" && rustup override set "${{ matrix.rust }}"
+      - name: Check formatting
+        if: matrix.rust == 'stable'
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all -- --check
+          rustfmt --check --edition 2024 tools/group_sync.rs
+      - name: Run Clippy
+        if: matrix.rust == 'stable'
+        run: rustup component add clippy && cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --locked
+      - name: Smoke-test the release benchmark
+        if: matrix.rust == 'stable'
+        run: |
+          cargo build --release --locked --example perf
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          target/release/examples/perf fixture "$scratch/fixture" 16
+          target/release/examples/perf run "$scratch/fixture" 16 16 1 "$scratch"
