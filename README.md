@@ -24,6 +24,8 @@ fn main() -> Result<()> {
 
 Keys and values can contain arbitrary bytes. Keys must have at least one byte, and a stored empty value is returned as `Some(Vec::new())`. The formats limit each key and value to `u32::MAX` bytes. `open_with_options` accepts smaller per-handle limits. To configure the approximate MemTable byte threshold, call `MiniDB::open_with_flush_threshold(path, options, bytes)`. The default threshold is 4 MiB. A threshold of zero flushes after every successful mutation.
 
+For setup instructions, runnable examples, and error handling, see the [MiniDB usage guide](docs/usage.md).
+
 ## Architecture
 
 `MiniDB::open` acquires an exclusive directory lock, reads the manifest and live table indexes, and replays the active WAL into a `BTreeMap` MemTable. An existing WAL-only database is upgraded automatically. Keep using a manifest-aware version after upgrade because older writers ignore the manifest. Reads check the MemTable first, then search SSTables newest to oldest. Each candidate table needs at most one checksummed data block. Version 2 SSTable Bloom filters can skip a block on a definite miss. The per-handle cache reuses previously verified blocks. The public `get` API returns owned bytes for a value and `None` for a deleted or missing key.
