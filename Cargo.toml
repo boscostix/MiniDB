@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "An embedded byte-oriented key-value storage engine"
+license = "MIT"
 readme = "README.md"
 
 [dependencies]

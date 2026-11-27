@@ -61,3 +61,7 @@ cargo +1.88.0 test --locked
 ```
 
 The GitHub Actions workflow runs formatting, strict Clippy, and locked tests on stable Rust and the minimum supported Rust version. It also runs a small release-mode benchmark smoke test.
+
+## License
+
+MiniDB is licensed under the [MIT License](LICENSE).
