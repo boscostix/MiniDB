@@ -12,6 +12,7 @@ use std::{
 
 use crate::{
     Error, Options, Result,
+    block_cache::{BlockCache, DEFAULT_CAPACITY},
     compaction::{self, INPUT_COUNT},
     manifest::{self, Manifest},
     memtable::{Entry, MemTable},
@@ -29,12 +30,13 @@ pub struct MiniDB {
     options: Options,
     flush_threshold_bytes: usize,
     shared: Arc<Shared>,
+    cache: BlockCache,
     writers: Mutex<()>,
     flush_requests: Option<mpsc::Sender<FlushRequest>>,
     flush_worker: Option<JoinHandle<()>>,
     compaction_worker: Option<JoinHandle<()>>,
     // Keep the lock until after the workers and WAL handle close.
-    _lock: File,
+    _lock: DirectoryLock,
 }
 
 struct State {
@@ -173,6 +175,7 @@ impl MiniDB {
             options,
             flush_threshold_bytes,
             shared,
+            cache: BlockCache::new(DEFAULT_CAPACITY),
             writers: Mutex::new(()),
             flush_requests: Some(flush_requests),
             flush_worker: Some(flush_worker),
@@ -225,8 +228,9 @@ impl MiniDB {
         let tables = Arc::clone(&view.tables);
         drop(view);
         on_snapshot();
+        let mut hash = None;
         for table in tables.iter().rev() {
-            match table.get(key)? {
+            match table.get(key, &mut hash, &self.cache)? {
                 Some(Entry::Value(value)) => return Ok(Some(value)),
                 Some(Entry::Tombstone) => return Ok(None),
                 None => {}
@@ -631,7 +635,17 @@ fn length_limit(configured: Option<usize>) -> usize {
         .min(Wal::MAX_FIELD_LEN)
 }
 
-fn lock_directory(path: &Path) -> Result<File> {
+struct DirectoryLock(File);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // A duplicated descriptor (including a child between fork and exec)
+        // can keep the open file description alive after our descriptor closes.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn lock_directory(path: &Path) -> Result<DirectoryLock> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -640,7 +654,7 @@ fn lock_directory(path: &Path) -> Result<File> {
         .open(path.join("LOCK"))
         .map_err(|error| Error::io("open database lock file", error))?;
     match fs2::FileExt::try_lock_exclusive(&lock) {
-        Ok(()) => Ok(lock),
+        Ok(()) => Ok(DirectoryLock(lock)),
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Err(Error::DatabaseLocked)
         }
@@ -658,6 +672,21 @@ mod tests {
     const TEST_DIRECTORY: &str = "MINIDB_FLUSH_CRASH_DIRECTORY";
     const TEST_STAGE: &str = "MINIDB_FLUSH_CRASH_STAGE";
     const CRASH_CODE: i32 = 74;
+
+    #[test]
+    fn close_releases_directory_lock_with_a_duplicated_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let db = MiniDB::open(path).unwrap();
+        let duplicate = db._lock.0.try_clone().unwrap();
+        assert!(matches!(MiniDB::open(path), Err(Error::DatabaseLocked)));
+        db.close().unwrap();
+
+        let reopened = MiniDB::open(path).unwrap();
+        drop(duplicate);
+        assert!(matches!(MiniDB::open(path), Err(Error::DatabaseLocked)));
+        reopened.close().unwrap();
+    }
 
     #[test]
     fn interrupted_flush_recovers_at_each_publication_boundary() {

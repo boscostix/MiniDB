@@ -124,14 +124,20 @@ fn compaction_preserves_suffix_precedence_and_in_flight_reads() {
         assert!(!Sstable::path(path, id).exists());
     }
     let output = Sstable::open(path, 6).unwrap();
-    assert!(output.get(b"discarded").unwrap().is_none());
+    let cache = BlockCache::new(0);
     assert!(
-        matches!(output.get(b"shared").unwrap(), Some(Entry::Value(value)) if value == vec![4; 6000])
+        output
+            .get(b"discarded", &mut None, &cache)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        matches!(output.get(b"shared", &mut None, &cache).unwrap(), Some(Entry::Value(value)) if value == vec![4; 6000])
     );
     assert!(matches!(
         Sstable::open(path, 5)
             .unwrap()
-            .get(b"suffix-deleted")
+            .get(b"suffix-deleted", &mut None, &cache)
             .unwrap(),
         Some(Entry::Tombstone)
     ));

@@ -1,6 +1,6 @@
 # MiniDB storage formats and durability
 
-A MiniDB directory holds a `MANIFEST`, a `LOCK` file, the active WAL, and zero or more SSTables. The contents of `LOCK` are unused. MiniDB holds an exclusive advisory lock on the open file throughout recovery and use. Keep the lock file in place and open the database through MiniDB. The operating system releases the lock when the handle closes or the process exits. Integers in all formats are unsigned and little-endian. Checksums use IEEE CRC-32.
+A MiniDB directory holds a `MANIFEST`, a `LOCK` file, the active WAL, and zero or more SSTables. The contents of `LOCK` are unused. MiniDB holds an exclusive advisory lock on the open file throughout recovery and use. Keep the lock file in place and open the database through MiniDB. Closing the handle releases the lock after its workers and WAL close. The operating system releases it on process exit. Integers in all formats are unsigned and little-endian. Checksums use IEEE CRC-32.
 
 ## WAL version 1
 
@@ -18,15 +18,19 @@ The file starts with the six ASCII bytes `MINIDB` and a two-byte version number 
 
 The header checksum covers the operation and both lengths, so corrupted sizing fields are checked before recovery uses them to find the end of a record. Recovery checks that the declared record fits within the file before allocating its payload. The reader buffers I/O and decodes one record at a time while rebuilding the MemTable.
 
-## SSTable version 1
+## SSTable versions 1 and 2
 
-An SSTable is named `sst-{id}.sst`, with the ID written as 20 zero-padded decimal digits. It starts with seven ASCII bytes `MINISST`, a one-byte version number with value 1, and an eight-byte table ID. Data blocks begin immediately after this 16-byte file header.
+An SSTable is named `sst-{id}.sst`, with the ID written as 20 zero-padded decimal digits. It starts with seven ASCII bytes `MINISST`, a one-byte version number with value 1 or 2, and an eight-byte table ID. Data blocks begin immediately after this 16-byte file header.
 
 - **Data blocks.** Each block contains one or more records, followed by a four-byte CRC-32 of the record bytes. A record has the same one-byte operation, four-byte key length, four-byte value length, and raw key and value bytes as a WAL record. Checksums are computed per block. Keys are strictly lexicographically ordered by byte and unique within a table. A block targets 4096 record bytes. A larger record occupies its own block.
-- **Index.** After the final block is an eight-byte block count followed by one entry per block. An entry contains an eight-byte absolute block offset, a four-byte first-key length, and the first key. The next offset, or the index start for the last block, defines each block's end.
+- **Index.** After the final block is an eight-byte block count followed by one entry per block. An entry contains an eight-byte absolute block offset, a four-byte first-key length, and the first key. In version 2, each entry then contains a two-byte Bloom filter length and that many filter bytes. The next offset, or the index start for the last block, defines each block's end.
 - **Footer.** The final 12 bytes contain an eight-byte absolute index offset and a four-byte CRC-32 of all index bytes followed by the index offset bytes.
 
-Opening a table validates its header, ID, index checksum, block bounds, and index ordering. The database retains the table path and index. Lookups binary-search the sparse index, open the selected file for the candidate block read, and verify the block checksum, record structure, and ordering. An unread data block can contain corruption discovered only when the block is read.
+A version 2 writer uses ten filter bits per record, rounded up to a whole byte, with a minimum of eight bytes and a maximum of 512. Every record contributes its key, including tombstones. A probe starts with the 64-bit FNV-1a hash of the key and applies the MurmurHash3 64-bit finalizer. For each integer `i` from 0 through 6, compute the low 32 hash bits plus `i` times the high 32 bits with the low bit set, using unsigned 32-bit wrapping arithmetic. Reduce the result modulo the filter's bit count. Use the least significant bit first within each byte. Both the filter length and bits are covered by the index checksum. A negative result rules out the candidate block. A positive result requires an exact key lookup.
+
+Opening a table validates its header, ID, index checksum, block bounds, and index ordering. New flush or compaction output uses version 2. Existing version 1 tables use the same index and block search without a filter. Old binaries that only recognize version 1 reject version 2 tables, so keep an older-compatible backup if rollback is needed. WAL and manifest formats retain their existing versions.
+
+The database retains the table path and index. Point lookups binary-search the sparse index and probe the candidate Bloom filter when present. On a cache miss, MiniDB opens the table, reads the selected block and its checksum together, and validates checksum, record structure, and ordering. The per-handle cache retains only validated immutable blocks and indexes their records for binary search. Its keys include the table ID and block number. Compaction reads and validates its own stream. A cached block is a previously verified copy, and an unread block can contain corruption discovered only when MiniDB reads it.
 
 ## Manifest versions 1 and 2
 

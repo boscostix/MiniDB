@@ -1,20 +1,27 @@
 use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    mem::size_of,
     ops::Range,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crc32fast::Hasher;
 
 use crate::{
     Error, Result,
+    block_cache::BlockCache,
+    bloom,
     memtable::{Entry, MemTable},
     storage::{numbered_file_id, read_array, read_vec, remove_file_if_exists, stage_file},
 };
 
-const HEADER: [u8; 8] = *b"MINISST\x01";
+const HEADER_V1: [u8; 8] = *b"MINISST\x01";
+const HEADER_V2: [u8; 8] = *b"MINISST\x02";
 const FILE_HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 12;
 const CHECKSUM_LEN: u64 = 4;
@@ -30,6 +37,7 @@ const DELETE: u8 = 2;
 struct BlockIndex {
     first_key: Vec<u8>,
     offset: u64,
+    filter: Box<[u8]>,
 }
 
 pub(crate) struct Sstable {
@@ -76,7 +84,7 @@ impl Sstable {
     ) -> Result<Option<Self>> {
         let path = Self::path(directory, id);
         let (temporary, mut file) = stage_file(&path)?;
-        file.write_all(&HEADER)
+        file.write_all(&HEADER_V2)
             .and_then(|()| file.write_all(&id.to_le_bytes()))
             .map_err(|error| Error::io(IO_WRITE, error))?;
         let mut writer = TableWriter {
@@ -84,6 +92,7 @@ impl Sstable {
             index: Vec::new(),
             offset: FILE_HEADER_LEN,
             block_crc: Hasher::new(),
+            block_hashes: Vec::new(),
         };
         write_records(&mut writer)?;
         if writer.index.is_empty() {
@@ -128,9 +137,11 @@ impl Sstable {
             return Err(corrupt(id, "file is too short"));
         }
         let header = read_array::<8>(&mut file, IO_READ)?;
-        if header != HEADER {
-            return Err(corrupt(id, "invalid magic or unsupported version"));
-        }
+        let filtered = match header {
+            HEADER_V1 => false,
+            HEADER_V2 => true,
+            _ => return Err(corrupt(id, "invalid magic or unsupported version")),
+        };
         if u64::from_le_bytes(read_array(&mut file, IO_READ)?) != id {
             return Err(corrupt(id, "table ID does not match manifest"));
         }
@@ -152,6 +163,7 @@ impl Sstable {
             id,
             index_address,
             expected_checksum,
+            filtered,
         )?;
         Ok(Self {
             path,
@@ -162,32 +174,41 @@ impl Sstable {
         })
     }
 
-    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Entry>> {
+    pub(crate) fn get(
+        &self,
+        key: &[u8],
+        hash: &mut Option<u64>,
+        cache: &BlockCache,
+    ) -> Result<Option<Entry>> {
         let candidates = self
             .index
             .partition_point(|item| item.first_key.as_slice() <= key);
         let Some(block_number) = candidates.checked_sub(1) else {
             return Ok(None);
         };
-        let mut file =
-            File::open(&self.path).map_err(|error| Error::io("open SSTable for lookup", error))?;
-        let bytes = self.read_block(&mut file, block_number)?;
-        let mut entry = None;
-        self.visit_records(block_number, &bytes, |record| {
-            if &bytes[record.key] == key {
-                entry = Some(match record.value {
-                    Some(value) => Entry::Value(bytes[value].to_vec()),
-                    None => Entry::Tombstone,
-                });
-            }
-        })?;
-        Ok(entry)
+        let filter = &self.index[block_number].filter;
+        if !filter.is_empty()
+            && !bloom::might_contain(filter, *hash.get_or_insert_with(|| bloom::hash(key)))
+        {
+            return Ok(None);
+        }
+
+        let cache_key = (self.id, block_number);
+        let block = if let Some(block) = cache.get(cache_key) {
+            block
+        } else {
+            let mut file = File::open(&self.path)
+                .map_err(|error| Error::io("open SSTable for lookup", error))?;
+            let block = Arc::new(self.load_block(&mut file, block_number)?);
+            cache.insert(cache_key, block)
+        };
+        Ok(block.get(key))
     }
 
     pub(crate) fn cursor(&self) -> Result<TableCursor<'_>> {
         let mut file = File::open(&self.path)
             .map_err(|error| Error::io("open SSTable for compaction", error))?;
-        let block = Some(self.read_cursor_block(&mut file, 0)?);
+        let block = Some(self.load_block(&mut file, 0)?);
         Ok(TableCursor {
             table: self,
             file,
@@ -202,8 +223,10 @@ impl Sstable {
         let next = self.index.get(block_number + 1);
         let end = next.map_or(self.index_offset, |item| item.offset);
         seek(file, block.offset)?;
-        let bytes = read_vec(file, end - block.offset - CHECKSUM_LEN, IO_READ)?;
-        let checksum = u32::from_le_bytes(read_array(file, IO_READ)?);
+        let mut bytes = read_vec(file, end - block.offset, IO_READ)?;
+        let payload_len = bytes.len() - CHECKSUM_LEN as usize;
+        let checksum = u32::from_le_bytes(bytes[payload_len..].try_into().expect("checksum size"));
+        bytes.truncate(payload_len);
         if crc32fast::hash(&bytes) != checksum {
             return Err(corrupt(self.id, "block checksum mismatch"));
         }
@@ -227,7 +250,7 @@ impl Sstable {
         )
     }
 
-    fn read_cursor_block(&self, file: &mut File, block_number: usize) -> Result<Block> {
+    fn load_block(&self, file: &mut File, block_number: usize) -> Result<Block> {
         let bytes = self.read_block(file, block_number)?;
         let mut records = Vec::new();
         self.visit_records(block_number, &bytes, |record| records.push(record))?;
@@ -270,10 +293,7 @@ impl TableCursor<'_> {
             self.block_number += 1;
             self.record_number = 0;
             if self.block_number < self.table.index.len() {
-                self.block = Some(
-                    self.table
-                        .read_cursor_block(&mut self.file, self.block_number)?,
-                );
+                self.block = Some(self.table.load_block(&mut self.file, self.block_number)?);
             }
         }
         Ok(())
@@ -285,6 +305,7 @@ pub(crate) struct TableWriter {
     index: Vec<BlockIndex>,
     offset: u64,
     block_crc: Hasher,
+    block_hashes: Vec<u64>,
 }
 
 impl TableWriter {
@@ -306,6 +327,7 @@ impl TableWriter {
             Some(_) => {}
         }
 
+        self.block_hashes.push(bloom::hash(key));
         let mut record = [0; RECORD_HEADER_LEN];
         record[0] = operation;
         record[1..5].copy_from_slice(&(key.len() as u32).to_le_bytes());
@@ -321,10 +343,14 @@ impl TableWriter {
         self.index.push(BlockIndex {
             first_key: key.to_vec(),
             offset: self.offset,
+            filter: Box::default(),
         });
     }
 
     fn finish_block(&mut self) -> io::Result<()> {
+        let block = self.index.last_mut().expect("finish requires a block");
+        block.filter = bloom::build(&self.block_hashes);
+        self.block_hashes.clear();
         let crc = std::mem::take(&mut self.block_crc);
         self.file.write_all(&crc.finalize().to_le_bytes())?;
         self.offset += CHECKSUM_LEN;
@@ -347,6 +373,12 @@ impl TableWriter {
                 &(block.first_key.len() as u32).to_le_bytes(),
             )?;
             write_hashed(&mut self.file, &mut crc, &block.first_key)?;
+            write_hashed(
+                &mut self.file,
+                &mut crc,
+                &(block.filter.len() as u16).to_le_bytes(),
+            )?;
+            write_hashed(&mut self.file, &mut crc, &block.filter)?;
         }
         write_hashed(&mut self.file, &mut crc, &self.offset.to_le_bytes())?;
         self.file.write_all(&crc.finalize().to_le_bytes())?;
@@ -356,9 +388,29 @@ impl TableWriter {
     }
 }
 
-struct Block {
+pub(crate) struct Block {
     bytes: Vec<u8>,
     records: Vec<Record>,
+}
+
+impl Block {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of::<Self>()
+            + 2 * size_of::<usize>()
+            + self.bytes.capacity()
+            + self.records.capacity() * size_of::<Record>()
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Entry> {
+        let position = self
+            .records
+            .binary_search_by(|record| self.bytes[record.key.clone()].cmp(key))
+            .ok()?;
+        Some(match self.records[position].value.clone() {
+            Some(value) => Entry::Value(self.bytes[value].to_vec()),
+            None => Entry::Tombstone,
+        })
+    }
 }
 
 struct Record {
@@ -373,6 +425,7 @@ fn read_index(
     id: u64,
     index_address: [u8; 8],
     expected_checksum: u32,
+    filtered: bool,
 ) -> Result<Vec<BlockIndex>> {
     let mut crc = Hasher::new();
     let count = read_array(&mut reader, IO_READ)?;
@@ -413,7 +466,29 @@ fn read_index(
         crc.update(&raw_offset);
         crc.update(&raw_key_len);
         crc.update(&first_key);
-        index.push(BlockIndex { first_key, offset });
+        let filter = if filtered {
+            if remaining < 2 {
+                return Err(corrupt(id, "missing Bloom filter length"));
+            }
+            let raw_len = read_array(&mut reader, IO_READ)?;
+            let filter_len = usize::from(u16::from_le_bytes(raw_len));
+            remaining -= 2;
+            if !bloom::valid_len(filter_len) || filter_len as u64 > remaining {
+                return Err(corrupt(id, "invalid Bloom filter length"));
+            }
+            let filter = read_vec(&mut reader, filter_len as u64, IO_READ)?.into_boxed_slice();
+            remaining -= filter_len as u64;
+            crc.update(&raw_len);
+            crc.update(&filter);
+            filter
+        } else {
+            Box::default()
+        };
+        index.push(BlockIndex {
+            first_key,
+            offset,
+            filter,
+        });
     }
     if remaining != 0 {
         return Err(corrupt(id, "unexpected bytes at end of index"));
@@ -497,3 +572,6 @@ fn write_hashed(writer: &mut impl Write, crc: &mut Hasher, bytes: &[u8]) -> io::
 fn corrupt(id: u64, reason: &'static str) -> Error {
     Error::CorruptSstable { id, reason }
 }
+
+#[cfg(test)]
+mod tests;
